@@ -27,8 +27,8 @@ Este é um script em Python para automatizar o download de materiais de cursos d
 1.  **Clone ou baixe este repositório:**
 
     ```bash
-    git clone https://github.com/seu-usuario/seu-repositorio.git
-    cd seu-repositorio
+    git clone https://github.com/DemiurgoGM/AutoDownloadEstrategiaConcurso.git
+    cd AutoDownloadEstrategiaConcurso
     ```
 
 2.  **Instale as bibliotecas Python necessárias:**
