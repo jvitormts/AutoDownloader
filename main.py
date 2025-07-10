@@ -189,9 +189,9 @@ def download_lesson_materials(driver, lesson_info, course_title):
 
     handle_popups(driver)
 
-    sanitized_course_title = sanitize_filename(course_title, max_length=80)
+    sanitized_course_title = sanitize_filename(course_title)
     # O nome da pasta agora é baseado apenas no título principal da aula
-    sanitized_lesson_title = sanitize_filename(lesson_title, max_length=120)
+    sanitized_lesson_title = sanitize_filename(lesson_title)
 
     lesson_download_path = os.path.join(DOWNLOAD_DIR, sanitized_course_title, sanitized_lesson_title)
 
@@ -310,7 +310,7 @@ def download_lesson_materials(driver, lesson_info, course_title):
                     driver.execute_script("arguments[0].click();", download_options_header)
                     WebDriverWait(driver, 5).until(EC.visibility_of(collapse_body))
 
-                sanitized_video_title = sanitize_filename(video_info['title'], max_length=80)
+                sanitized_video_title = sanitize_filename(video_info['title'])
                 preferred_qualities = ["720p", "480p", "360p"]
                 downloaded_successfully = False
 
