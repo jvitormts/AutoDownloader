@@ -22,7 +22,7 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # --- Funções Auxiliares ---
 
-def sanitize_filename(original_filename, max_length=150):
+def sanitize_filename(original_filename):
     """
     Remove caracteres inválidos de um nome de arquivo/diretório.
     """
@@ -34,10 +34,6 @@ def sanitize_filename(original_filename, max_length=150):
     # Substitui espaços e hífens múltiplos por um único underscore
     sanitized = re.sub(r'[\s-]+', '_', sanitized)
     sanitized = sanitized.strip('._- ')
-
-    # Truncamento final como medida de segurança
-    if len(sanitized) > max_length:
-        sanitized = sanitized[:max_length]
 
     return sanitized.strip()
 
