@@ -5,6 +5,7 @@ Este é um script em Python para automatizar o download de materiais de cursos d
 ## Funcionalidades
 
   - **Login Manual:** O script abre a página de login e aguarda que o usuário insira suas credenciais manualmente.
+  - **Configuração Flexível:** Permite configurar o diretório de download e o tempo de espera para o login diretamente pela linha de comando.
   - **Listagem de Cursos:** Identifica e lista todos os cursos disponíveis na sua página "Meus Cursos".
   - **Extração de Aulas:** Para cada curso, o script acessa a página e extrai a lista completa de aulas disponíveis.
   - **Organização de Arquivos:** Cria uma estrutura de pastas hierárquica para os materiais baixados: `DIRETÓRIO_DE_DOWNLOAD / NOME_DO_CURSO / NOME_DA_AULA /`.
@@ -41,34 +42,77 @@ Este é um script em Python para automatizar o download de materiais de cursos d
 3.  **WebDriver do Edge:**
     O Selenium 4 e superior geralmente gerencia o `msedgedriver` automaticamente. Se você encontrar problemas, certifique-se de que sua versão do Microsoft Edge está atualizada.
 
-## Configuração
+## Configuração (Via Linha de Comando)
 
-**Este é o passo mais importante\!** Antes de executar o script, você **precisa** editar o arquivo e alterar a seguinte variável:
+A configuração do script é feita de forma flexível através de argumentos na linha de comando. 
 
-  - `DOWNLOAD_DIR`: Altere o caminho `"E:/Estrategia"` para o diretório no seu computador onde você deseja que os cursos sejam salvos.
+### Argumentos Disponíveis:
 
-<!-- end list -->
+  - `-d, --dir PATH`
 
-```python
-# --- Configurações ---
-# ...
-# IMPORTANTE: Mude para o seu diretório de download
-DOWNLOAD_DIR = "C:/Users/SeuUsuario/Documents/MeusCursos" # Exemplo para Windows
-# ou
-DOWNLOAD_DIR = "/home/seu-usuario/Documentos/MeusCursos" # Exemplo para Linux
-```
+      - Define o diretório de download. Substitua `PATH` pelo caminho completo onde os cursos serão salvos.
+      - **Se não for fornecido, usará o valor padrão definido no script (`E:/Estrategia`).**
+
+  - `-w, --wait-time SECONDS`
+
+      - Define o tempo de espera (em segundos) para que você realize o login manual.
+      - **O padrão é 60 segundos.**
 
 ## Como Usar
 
 1.  Abra um terminal (Prompt de Comando, PowerShell, ou Terminal do Linux/macOS).
 2.  Navegue até o diretório onde você salvou o script.
-3.  Execute o script com o comando:
-    ```bash
-    python main.py
-    ```
-4.  Uma janela do navegador Microsoft Edge será aberta na página de login do Estratégia.
-5.  **Você terá 60 segundos para fazer o login manualmente** com seu e-mail e senha.
-6.  Após o login, não feche o navegador. O script retomará automaticamente e começará a processar seus cursos e aulas.
+3.  Execute o script usando `python` e os argumentos desejados.
+
+-----
+
+### **Exemplos de Uso:**
+
+**1. Uso Básico (utiliza os valores padrão)**
+
+```bash
+python main.py
+```
+
+> O script salvará os arquivos em `E:/Estrategia` e aguardará `60` segundos pelo login.
+
+**2. Definindo um Diretório de Download Específico**
+
+```bash
+# Para Windows
+python main.py --dir "C:\Users\SeuNome\Downloads\CursosEstrategia"
+
+# Para Linux/macOS (forma longa)
+python main.py --dir "/home/seu-usuario/Documentos/Cursos"
+
+# Para Linux/macOS (forma curta)
+python main.py -d "/home/seu-usuario/Documentos/Cursos"
+```
+
+> **Dica:** Use aspas `""` ao redor do caminho se ele contiver espaços.
+
+**3. Aumentando o Tempo de Espera para o Login**
+
+```bash
+# Aumenta o tempo de espera para 2 minutos (120 segundos)
+python main.py --wait-time 120
+
+# Forma curta
+python main.py -w 120
+```
+
+**4. Combinando Argumentos**
+
+```bash
+# Salva os cursos em D:\Concursos e aguarda 90 segundos pelo login
+python main.py -d "D:\Concursos" -w 90
+```
+
+-----
+
+4.  Após executar o comando, uma janela do navegador Microsoft Edge será aberta na página de login do Estratégia.
+5.  **Você terá o tempo configurado (padrão: 60s) para fazer o login manualmente.**
+6.  Após o login, não feche o navegador. O script retomará automaticamente e começará o processo de download.
 7.  Aguarde o término do processo. O progresso será exibido no terminal.
 
 ## Como Funciona
