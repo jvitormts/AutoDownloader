@@ -1,6 +1,8 @@
 import os
 import re
 import time
+import argparse
+import sys
 from urllib.parse import urljoin
 
 import requests
@@ -13,26 +15,22 @@ from selenium.webdriver.support.ui import WebDriverWait
 # --- Configurações ---
 BASE_URL = "https://www.estrategiaconcursos.com.br"
 MY_COURSES_URL = urljoin(BASE_URL, "/app/dashboard/cursos")
-# IMPORTANTE: Mude para o seu diretório de download
-DOWNLOAD_DIR = "E:/Estrategia"
-
-# Garante que o diretório de download existe
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 
 # --- Funções Auxiliares ---
 
 def sanitize_filename(original_filename):
     """
-    Remove caracteres inválidos de um nome de arquivo/diretório.
+    Remove caracteres inválidos de um nome de arquivo/diretório para garantir
+    compatibilidade com o sistema de arquivos.
     """
-    # Sanitização de caracteres
-    # Remove caracteres inválidos do Windows
+    # Remove caracteres inválidos do Windows e outros sistemas
     sanitized = re.sub(r'[<>:"/\\|?*]', '', original_filename)
     # Remove pontos e vírgulas para nomes mais limpos
     sanitized = re.sub(r'[.,]', '', sanitized)
     # Substitui espaços e hífens múltiplos por um único underscore
     sanitized = re.sub(r'[\s-]+', '_', sanitized)
+    # Remove underscores, pontos ou hífens no início ou fim
     sanitized = sanitized.strip('._- ')
 
     return sanitized.strip()
@@ -40,20 +38,23 @@ def sanitize_filename(original_filename):
 
 def download_file(url, file_path, current_page_url=None):
     """
-    Realiza o download de um arquivo usando a biblioteca requests.
+    Realiza o download de um arquivo usando a biblioteca requests, com
+    cabeçalhos adequados e tratamento de erros.
     """
     print(f"   Tentando baixar: {os.path.basename(file_path)}")
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7'
     }
+    # O cabeçalho 'Referer' pode ser crucial para evitar erros de acesso negado (403 Forbidden)
     if current_page_url:
         headers['Referer'] = current_page_url
 
     try:
         response = requests.get(url, stream=True, timeout=60, headers=headers)
-        response.raise_for_status()
+        response.raise_for_status()  # Lança uma exceção para códigos de erro HTTP (4xx ou 5xx)
 
+        # Verifica se o arquivo não é suspeitamente pequeno (pode ser uma página de erro)
         content_length = response.headers.get('content-length')
         if content_length and int(content_length) < 1024:
             print(f"     AVISO: Conteúdo suspeitamente pequeno ({content_length} bytes). Pode ser uma página de erro.")
@@ -75,10 +76,12 @@ def handle_popups(driver):
     """Tenta fechar popups conhecidos que podem interceptar cliques."""
     print("        Verificando e lidando com popups/overlays...")
     try:
+        # Espera por um elemento específico do popup
         getsitecontrol_widget = WebDriverWait(driver, 3).until(
             EC.presence_of_element_located((By.ID, "getsitecontrol-44266"))
         )
         print("        Widget 'getsitecontrol' detectado. Tentando fechar via JavaScript.")
+        # Usa JavaScript para esconder o elemento, uma tática mais robusta que cliques
         driver.execute_script("arguments[0].style.display = 'none';", getsitecontrol_widget)
         time.sleep(1)
     except TimeoutException:
@@ -93,10 +96,11 @@ def get_course_data(driver):
     driver.get(MY_COURSES_URL)
 
     try:
+        # Espera até que os cards dos cursos estejam presentes na página
         WebDriverWait(driver, 30).until(
             EC.presence_of_all_elements_located((By.CSS_SELECTOR, "section[id^='card'] a.sc-cHGsZl"))
         )
-        time.sleep(3)
+        time.sleep(3)  # Pausa adicional para garantir que tudo carregou
 
         course_elements = driver.find_elements(By.CSS_SELECTOR, "section[id^='card']")
         courses = []
@@ -134,21 +138,20 @@ def get_lesson_data(driver, course_url):
         lessons = []
         for lesson_elem in lesson_elements:
             try:
+                # Pula aulas desabilitadas
                 if "isDisabled" in lesson_elem.get_attribute("class"):
                     continue
 
                 link_elem = lesson_elem.find_element(By.CSS_SELECTOR, "a.Collapse-header")
-                # Pega o título principal (h2)
                 title_h2_elem = lesson_elem.find_element(By.CSS_SELECTOR, "h2.SectionTitle")
                 lesson_title = title_h2_elem.text
 
-                # Pega o subtítulo (p), se existir
                 lesson_subtitle = ""
                 try:
                     title_p_elem = lesson_elem.find_element(By.CSS_SELECTOR, "p.sc-gZMcBi")
                     lesson_subtitle = title_p_elem.text
                 except NoSuchElementException:
-                    pass  # Não há problema se não houver subtítulo
+                    pass  # É normal não haver subtítulo
 
                 lesson_href = link_elem.get_attribute('href')
                 if lesson_href and lesson_title:
@@ -166,10 +169,9 @@ def get_lesson_data(driver, course_url):
         return []
 
 
-def download_lesson_materials(driver, lesson_info, course_title):
+def download_lesson_materials(driver, lesson_info, course_title, download_dir):
     """
-    Navega para a página de uma aula, salva o subtítulo em um .txt e baixa
-    os materiais disponíveis (PDFs e todos os vídeos).
+    Navega para a página de uma aula, salva o subtítulo e baixa os materiais.
     """
     lesson_title = lesson_info['title']
     lesson_subtitle = lesson_info['subtitle']
@@ -190,10 +192,10 @@ def download_lesson_materials(driver, lesson_info, course_title):
     handle_popups(driver)
 
     sanitized_course_title = sanitize_filename(course_title)
-    # O nome da pasta agora é baseado apenas no título principal da aula
     sanitized_lesson_title = sanitize_filename(lesson_title)
 
-    lesson_download_path = os.path.join(DOWNLOAD_DIR, sanitized_course_title, sanitized_lesson_title)
+    # Usa o diretório de download fornecido como argumento
+    lesson_download_path = os.path.join(download_dir, sanitized_course_title, sanitized_lesson_title)
 
     try:
         os.makedirs(lesson_download_path, exist_ok=True)
@@ -201,18 +203,18 @@ def download_lesson_materials(driver, lesson_info, course_title):
         print(f"       ERRO CRÍTICO ao criar diretório: {e}")
         return
 
-    # --- Salvar subtítulo em Assuntos_dessa_aula.txt ---
+    # Salva o subtítulo em um arquivo de texto
     if lesson_subtitle:
         subjects_file_path = os.path.join(lesson_download_path, "Assuntos_dessa_aula.txt")
         if not os.path.exists(subjects_file_path):
             try:
                 with open(subjects_file_path, 'w', encoding='utf-8') as f:
                     f.write(lesson_subtitle)
-                print(f"       Arquivo 'Assuntos_dessa_aula.txt' criado com sucesso.")
+                print(f"       Arquivo 'Assuntos_dessa_aula.txt' criado.")
             except Exception as e:
                 print(f"       Erro ao criar 'Assuntos_dessa_aula.txt': {e}")
 
-    # --- Baixar Livros Eletrônicos (PDFs) ---
+    # Baixa Livros Eletrônicos (PDFs)
     print("       Procurando por Livros Eletrônicos (PDFs)...")
     try:
         pdf_links = driver.find_elements(By.XPATH,
@@ -221,14 +223,18 @@ def download_lesson_materials(driver, lesson_info, course_title):
             pdf_url = pdf_link.get_attribute('href')
             if not pdf_url or "api.estrategiaconcursos.com.br" not in pdf_url:
                 continue
+
+            pdf_text_raw = "original"
             try:
                 version_text_element = pdf_link.find_element(By.CSS_SELECTOR, "span.LessonButton-text > span")
                 pdf_text_raw = version_text_element.text.strip()
             except NoSuchElementException:
-                pdf_text_raw = "original"
-            filename_suffix = "_" + sanitize_filename(pdf_text_raw) if pdf_text_raw else "_Original"
+                pass  # Mantém "original" se não encontrar texto específico
+
+            filename_suffix = "_" + sanitize_filename(pdf_text_raw)
             filename = f"{sanitized_lesson_title}_Livro_Eletronico{filename_suffix}.pdf"
             full_file_path = os.path.join(lesson_download_path, filename)
+
             if os.path.exists(full_file_path):
                 print(f"       PDF '{filename}' já existe. Pulando.")
             else:
@@ -237,7 +243,7 @@ def download_lesson_materials(driver, lesson_info, course_title):
     except Exception as e:
         print(f"       Erro ao processar PDFs: {e}")
 
-    # --- Baixar todos os Vídeos da Playlist ---
+    # Baixa todos os Vídeos da Playlist
     print("       Procurando por Vídeos...")
     try:
         playlist_items = WebDriverWait(driver, 10).until(
@@ -255,15 +261,14 @@ def download_lesson_materials(driver, lesson_info, course_title):
             print("       Nenhum vídeo encontrado na playlist.")
             return
 
-        print(f"       Encontrados {len(videos_to_download)} vídeos na playlist. Iniciando downloads...")
+        print(f"       Encontrados {len(videos_to_download)} vídeos. Iniciando downloads...")
 
         for i, video_info in enumerate(videos_to_download):
             print(f"\n        Processando vídeo {i + 1}/{len(videos_to_download)}: {video_info['title']}")
-
             driver.get(video_info['url'])
             time.sleep(2)
 
-            # --- Baixar PDFs específicos do vídeo (Resumo, Slides, Mapa Mental) ---
+            # Baixar PDFs específicos do vídeo (Resumo, Slides, etc.)
             print(f"          Procurando por PDFs específicos do vídeo '{video_title}'...")
             video_pdf_types = {
                 "Baixar Resumo": f"_Resumo_{i}.pdf",
@@ -298,6 +303,7 @@ def download_lesson_materials(driver, lesson_info, course_title):
                         f"          Erro ao processar '{pdf_button_text}' para o vídeo '{video_title}': {e}")
 
             try:
+                # Expande a seção "Opções de download" se estiver fechada
                 download_options_header = WebDriverWait(driver, 10).until(
                     EC.element_to_be_clickable(
                         (By.XPATH, "//div[contains(@class, 'Collapse-header')]//strong[text()='Opções de download']"))
@@ -331,7 +337,7 @@ def download_lesson_materials(driver, lesson_info, course_title):
                             downloaded_successfully = True
                             break
                     except NoSuchElementException:
-                        continue
+                        continue  # Tenta a próxima qualidade
 
                 if not downloaded_successfully:
                     print(
@@ -350,7 +356,7 @@ def download_lesson_materials(driver, lesson_info, course_title):
 
 
 # --- Função de Login ---
-def login(driver):
+def login(driver, wait_time):
     """
     Função para login. Atualmente, está configurada para uma pausa,
     permitindo que o usuário faça o login manualmente.
@@ -358,24 +364,36 @@ def login(driver):
     print("Navegando para a página de login...")
     driver.get("https://perfil.estrategia.com/login")
 
-    print("=" * 50)
-    print("Por favor, faça login manualmente no navegador que foi aberto.")
-    print("O script irá pausar por 60 segundos para você completar o login.")
-    print("Após o login, NÃO feche o navegador.")
-    print("=" * 50)
+    print("=" * 60)
+    print("AÇÃO NECESSÁRIA: FAÇA O LOGIN MANUALMENTE NO NAVEGADOR ABERTO")
+    print(f"O script ficará pausado por {wait_time} segundos para você completar o login.")
+    print("Após o login, o script continuará automaticamente.")
+    print("NÃO feche o navegador.")
+    print("=" * 60)
 
-    time.sleep(60)
+    time.sleep(wait_time)
 
     print("Pausa para login concluída. Continuando o script...")
 
 
 # --- Fluxo Principal ---
-def main():
+def run_downloader(download_dir, login_wait_time):
+    """
+    Função principal que orquestra todo o processo de download.
+    """
+    # Garante que o diretório de download de base exista
+    try:
+        os.makedirs(download_dir, exist_ok=True)
+        print(f"Diretório de download configurado para: {os.path.abspath(download_dir)}")
+    except OSError as e:
+        print(f"ERRO: Não foi possível criar o diretório de download '{download_dir}'. Erro: {e}")
+        sys.exit(1)  # Encerra o script se não puder criar o diretório
+
     driver = webdriver.Edge()
     driver.maximize_window()
 
     try:
-        login(driver)
+        login(driver, login_wait_time)
 
         courses = get_course_data(driver)
         if not courses:
@@ -392,8 +410,7 @@ def main():
 
             for j, lesson_info in enumerate(lessons):
                 print(f"\n    -> Processando aula {j + 1}/{len(lessons)}: {lesson_info['title']}")
-                # Passa o dicionário completo da aula para a função de download
-                download_lesson_materials(driver, lesson_info, course['title'])
+                download_lesson_materials(driver, lesson_info, course['title'], download_dir)
                 time.sleep(2)
 
     except Exception as e:
@@ -402,6 +419,36 @@ def main():
         print("\nProcesso concluído. Fechando o navegador em 10 segundos.")
         time.sleep(10)
         driver.quit()
+
+
+def main():
+    """
+    Analisa os argumentos da linha de comando e inicia o processo de download.
+    """
+    parser = argparse.ArgumentParser(
+        description="Baixador de cursos do Estratégia Concursos.",
+        formatter_class=argparse.RawTextHelpFormatter  # Melhora a formatação da ajuda
+    )
+
+    parser.add_argument(
+        '-d', '--dir',                      # Apenas os flags opcionais são listados aqui
+        dest='download_dir',                # 'dest' diz ao argparse para salvar o valor em 'args.download_dir'
+        metavar='PATH',                     # 'metavar' é o nome que aparece na mensagem de ajuda
+        type=str,
+        default="E:/Estrategia",            # O valor padrão se o argumento não for fornecido
+        help="O caminho completo para a pasta onde os cursos serão salvos.\n(Padrão: E:/Estrategia)"
+    )
+
+    parser.add_argument(
+        "-w", "--wait-time",
+        type=int,
+        default=60,
+        help="Tempo em segundos para aguardar o login manual (padrão: 60)."
+    )
+
+    args = parser.parse_args()
+
+    run_downloader(args.download_dir, args.wait_time)
 
 
 if __name__ == "__main__":
