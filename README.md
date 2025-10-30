@@ -1,4 +1,4 @@
-# Estratégia Concursos - Downloader de Cursos
+# Estratégia Concursos - Downloader de Cursos 
 
 Este é um script em Python para automatizar o download de materiais de cursos da plataforma Estratégia Concursos. Ele utiliza Selenium para navegar no site e `requests` para baixar os arquivos, organizando tudo em uma estrutura de pastas local.
 
@@ -28,7 +28,7 @@ Este é um script em Python para automatizar o download de materiais de cursos d
 1.  **Clone ou baixe este repositório:**
 
     ```bash
-    git clone https://github.com/DemiurgoGM/AutoDownloadEstrategiaConcurso.git
+    git clone https://github.com/jvitormts/AutoDownloader.git
     cd AutoDownloadEstrategiaConcurso
     ```
 
