@@ -5,6 +5,7 @@ import argparse
 import sys
 import pickle
 import threading
+import json
 from urllib.parse import urljoin
 import requests
 import logging
@@ -37,6 +38,522 @@ BASE_URL = "https://www.estrategiaconcursos.com.br"
 MY_COURSES_URL = urljoin(BASE_URL, "/app/dashboard/cursos")
 COOKIES_FILE = "estrategia_session_cookies.pkl"
 HEARTBEAT_INTERVAL = 300  # 5 minutos
+
+
+# ============================================================================
+# FEATURE 1: GERENCIADOR DE MANIFESTO DE ARQUIVOS
+# ============================================================================
+
+class FileManifestManager:
+    """
+    Gerencia o arquivo 'files_manifest.json' para rastreamento de downloads.
+
+    Rastreia cada arquivo baixado com:
+    - Timestamp de download
+    - Nome do arquivo
+    - Tamanho (bytes e MB)
+    - Tipo de arquivo (pdf, video, txt, etc)
+    - Tempo de download
+    - Status (success, error, skipped)
+    """
+
+    MANIFEST_FILENAME = "files_manifest.json"
+
+    def __init__(self, course_path: str, logger: logging.Logger = None):
+        """
+        Inicializa o gerenciador do manifesto.
+
+        Args:
+            course_path (str): Caminho da pasta do curso
+            logger (logging.Logger): Logger para registrar ações
+        """
+        self.course_path = course_path
+        self.manifest_path = os.path.join(course_path, self.MANIFEST_FILENAME)
+        self.logger = logger
+        self.manifest = self._load_manifest()
+
+    def _load_manifest(self) -> dict:
+        """Carrega o manifesto do disco ou cria um novo."""
+        if os.path.exists(self.manifest_path):
+            try:
+                with open(self.manifest_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(f"Erro ao carregar manifest: {e}")
+                return {}
+        return {}
+
+    def _save_manifest(self):
+        """Salva o manifesto no disco."""
+        try:
+            with open(self.manifest_path, 'w', encoding='utf-8') as f:
+                json.dump(self.manifest, f, indent=2, ensure_ascii=False)
+            if self.logger:
+                self.logger.debug(f"Manifesto salvo: {self.manifest_path}")
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Erro ao salvar manifest: {e}")
+
+    def start_lesson(self, lesson_title: str) -> None:
+        """Marca o início do rastreamento de uma aula."""
+        if lesson_title not in self.manifest:
+            self.manifest[lesson_title] = {
+                "timestamp": datetime.now().isoformat(),
+                "total_files": 0,
+                "files": []
+            }
+            if self.logger:
+                self.logger.info(f"Iniciando rastreamento: {lesson_title}")
+
+    def add_file(self, lesson_title: str, file_name: str, size_bytes: int,
+                 file_type: str, download_time: str = "", status: str = "success") -> None:
+        """
+        Adiciona um arquivo ao rastreamento de uma aula.
+
+        Args:
+            lesson_title (str): Título da aula
+            file_name (str): Nome do arquivo
+            size_bytes (int): Tamanho do arquivo em bytes
+            file_type (str): Tipo de arquivo (pdf, video, txt, etc)
+            download_time (str): Tempo gasto no download (HH:MM:SS)
+            status (str): Status do download (success, error, skipped)
+        """
+        if lesson_title not in self.manifest:
+            self.start_lesson(lesson_title)
+
+        file_entry = {
+            "name": file_name,
+            "size_bytes": size_bytes,
+            "size_mb": round(size_bytes / (1024 * 1024), 2),
+            "type": file_type,
+            "download_time": download_time,
+            "status": status,
+            "added_at": datetime.now().isoformat()
+        }
+
+        self.manifest[lesson_title]["files"].append(file_entry)
+        self.manifest[lesson_title]["total_files"] = len(self.manifest[lesson_title]["files"])
+
+        if self.logger:
+            self.logger.debug(f"Arquivo rastreado: {file_name} ({size_bytes} bytes)")
+
+    def finish_lesson(self, lesson_title: str) -> None:
+        """Marca a conclusão do rastreamento de uma aula."""
+        if lesson_title in self.manifest:
+            self.manifest[lesson_title]["completed_at"] = datetime.now().isoformat()
+            self._save_manifest()
+            if self.logger:
+                self.logger.info(
+                    f"Aula concluída: {lesson_title} ({self.manifest[lesson_title]['total_files']} arquivos)")
+
+    def get_downloaded_lessons(self) -> list:
+        """Retorna lista de aulas já rastreadas/baixadas."""
+        return list(self.manifest.keys())
+
+    def get_lesson_info(self, lesson_title: str) -> dict:
+        """Retorna informações de uma aula."""
+        return self.manifest.get(lesson_title)
+
+    def get_course_statistics(self) -> dict:
+        """Retorna estatísticas gerais do curso."""
+        total_lessons = len(self.manifest)
+        total_files = sum(lesson["total_files"] for lesson in self.manifest.values())
+        total_size_bytes = sum(
+            file["size_bytes"]
+            for lesson in self.manifest.values()
+            for file in lesson.get("files", [])
+        )
+
+        return {
+            "total_lessons": total_lessons,
+            "total_files": total_files,
+            "total_size_bytes": total_size_bytes,
+            "total_size_gb": round(total_size_bytes / (1024 ** 3), 2)
+        }
+
+
+# ============================================================================
+# FEATURE 2: DETECTOR DE PENDENTES
+# ============================================================================
+
+def find_incomplete_courses(driver, download_dir, available_courses, telegram):
+    """
+    Detecta cursos incompletos comparando:
+    - Total de aulas na PLATAFORMA
+    - Total de aulas já BAIXADAS localmente
+
+    Args:
+        driver: WebDriver do Selenium
+        download_dir: Diretório raiz de downloads
+        available_courses: Cursos disponíveis na plataforma
+        telegram: Notificador do Telegram
+
+    Returns:
+        list: Cursos incompletos com informações de progresso
+        Exemplo: [
+            {
+                'course': {'title': '...', 'url': '...'},
+                'platform_total': 17,
+                'local_total': 2,
+                'missing': 15,
+                'progress': '11.8%'
+            },
+            ...
+        ]
+    """
+
+    detector = PendingLessonsDetector(download_dir)
+    downloaded_courses = detector.scan_downloaded_courses()
+
+    if not downloaded_courses:
+        print("\n✓ Nenhum curso baixado ainda.")
+        return []
+
+    print(f"\n{'=' * 70}")
+    print(f"🔍 ANALISANDO PROGRESSO DOS CURSOS...")
+    print(f"{'=' * 70}\n")
+
+    incomplete = []
+
+    # Para cada curso já baixado localmente
+    for local_course_name, local_course_path in downloaded_courses.items():
+
+        # Contar aulas baixadas localmente
+        lessons_downloaded = detector.get_course_downloaded_lessons(local_course_path)
+        local_total = len(lessons_downloaded)
+
+        # Obter estatísticas do manifesto
+        manifest_path = os.path.join(local_course_path, FileManifestManager.MANIFEST_FILENAME)
+        if os.path.exists(manifest_path):
+            stats = FileManifestManager(local_course_path).get_course_statistics()
+        else:
+            stats = {'total_lessons': local_total, 'total_size_gb': 0}
+
+        # Procurar curso correspondente na plataforma
+        platform_course = None
+        platform_total = 0
+
+        for course in available_courses:
+            if detector._courses_match(local_course_name, course['title']):
+                platform_course = course
+                # Aqui você precisa acessar a plataforma para contar aulas
+                # Para agora, vamos obter via navegação
+                platform_total = get_total_lessons_from_platform(driver, course['url'], telegram)
+                break
+
+        if platform_course is None:
+            # Curso local não encontrado na plataforma
+            print(f"⚠️  Curso não encontrado na plataforma: {local_course_name}")
+            continue
+
+        # Calcular progresso
+        if platform_total > local_total:
+            # INCOMPLETO!
+            missing = platform_total - local_total
+            progress_pct = (local_total / platform_total) * 100
+
+            course_info = {
+                'course': platform_course,
+                'platform_total': platform_total,
+                'local_total': local_total,
+                'missing': missing,
+                'progress': f"{progress_pct:.1f}%",
+                'size_gb': stats.get('total_size_gb', 0)
+            }
+
+            incomplete.append(course_info)
+
+            print(f"  📚 {local_course_name}")
+            print(f"  ├─ 📊 Progresso: {local_total}/{platform_total} aulas ({progress_pct:.1f}%)")
+            print(f"  ├─ ❌ Faltam: {missing} aulas")
+            print(f"  ├─ 💾 Tamanho: {stats.get('total_size_gb', 0)} GB")
+            print(f"  └─ 🔗 Status: INCOMPLETO\n")
+
+            telegram.send(
+                f"📚 <b>{local_course_name}</b>\n"
+                f"Progresso: {local_total}/{platform_total} ({progress_pct:.1f}%)\n"
+                f"Faltam: {missing} aulas"
+            )
+        else:
+            # COMPLETO
+            progress_pct = 100
+
+            print(f"  📚 {local_course_name}")
+            print(f"  ├─ 📊 Progresso: {local_total}/{platform_total} aulas (100%)")
+            print(f"  ├─ ✅ Todas as aulas baixadas!")
+            print(f"  └─ 🔗 Status: COMPLETO\n")
+
+            telegram.send(
+                f"✅ <b>{local_course_name}</b>\n"
+                f"Todas as {platform_total} aulas foram baixadas!"
+            )
+
+    print(f"{'=' * 70}")
+
+    if incomplete:
+        print(f"\n⚠️  ENCONTRADOS {len(incomplete)} CURSO(S) COM AULAS FALTANDO!\n")
+    else:
+        print(f"\n✅ Todos os cursos estão completos!\n")
+
+    return incomplete
+
+
+def get_total_lessons_from_platform(driver, course_url, telegram):
+    """
+    Acessa o curso na plataforma e conta o total de aulas disponíveis.
+
+    Args:
+        driver: WebDriver do Selenium
+        course_url: URL do curso na plataforma
+        telegram: Notificador do Telegram
+
+    Returns:
+        int: Total de aulas disponíveis no curso
+    """
+    try:
+        print(f"  ⏳ Contando aulas na plataforma... ", end="", flush=True)
+
+        driver.get(course_url)
+
+        # Aguardar carregamento da lista de aulas
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.LessonList-item"))
+        )
+
+        time.sleep(2)
+
+        # Contar elementos de aula (inclusive aulas desabilitadas)
+        lesson_elements = driver.find_elements(By.CSS_SELECTOR, "div.LessonList-item")
+        total_lessons = len(lesson_elements)
+
+        print(f"✓ {total_lessons} aulas encontradas")
+
+        return total_lessons
+
+    except TimeoutException:
+        print("⚠️  Timeout ao contar aulas")
+        telegram.send("⚠️ Erro ao contar aulas na plataforma (timeout)")
+        return 0
+    except Exception as e:
+        print(f"❌ Erro: {e}")
+        telegram.send(f"❌ Erro ao contar aulas: {e}")
+        return 0
+
+class PendingLessonsDetector:
+    """
+    Detecta e gerencia aulas pendentes em cursos já iniciados.
+
+    Compara:
+    1. Aulas disponíveis na plataforma
+    2. Aulas já baixadas localmente (via manifest.json)
+    3. Identifica aulas pendentes
+    """
+
+    def __init__(self, download_base_path: str, logger: logging.Logger = None):
+        """
+        Inicializa o detector.
+
+        Args:
+            download_base_path (str): Caminho raiz de downloads (ex: E:/Estrategia)
+            logger (logging.Logger): Logger para registrar ações
+        """
+        self.base_path = download_base_path
+        self.logger = logger
+
+    def scan_downloaded_courses(self) -> dict:
+        """
+        Varre a pasta de downloads e retorna cursos encontrados.
+
+        Returns:
+            dict: Dicionário {nome_curso: caminho_curso}
+        """
+        courses = {}
+
+        if not os.path.exists(self.base_path):
+            return courses
+
+        try:
+            for item in os.listdir(self.base_path):
+                item_path = os.path.join(self.base_path, item)
+                # Verifica se é diretório (curso)
+                if os.path.isdir(item_path):
+                    courses[item] = item_path
+
+            if self.logger:
+                self.logger.info(f"Encontrados {len(courses)} cursos já baixados")
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Erro ao scanear cursos: {e}")
+
+        return courses
+
+    def get_course_downloaded_lessons(self, course_path: str) -> list:
+        """
+        Obtém lista de aulas já baixadas de um curso (via manifest).
+
+        Args:
+            course_path (str): Caminho da pasta do curso
+
+        Returns:
+            list: Lista de títulos de aulas baixadas
+        """
+        manifest_path = os.path.join(course_path, FileManifestManager.MANIFEST_FILENAME)
+
+        if os.path.exists(manifest_path):
+            try:
+                with open(manifest_path, 'r', encoding='utf-8') as f:
+                    manifest = json.load(f)
+                    return list(manifest.keys())
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(f"Erro ao ler manifest: {e}")
+
+        # Fallback: listar diretórios (aulas) se não houver manifest
+        try:
+            lessons = []
+            for item in os.listdir(course_path):
+                item_path = os.path.join(course_path, item)
+                if os.path.isdir(item_path) and item != "__pycache__":
+                    lessons.append(item)
+            return lessons
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Erro ao listar aulas: {e}")
+            return []
+
+    def _courses_match(self, course_name_1: str, course_name_2: str) -> bool:
+        """Verifica se dois nomes de curso referem-se ao mesmo curso."""
+        name1 = course_name_1.lower().strip()
+        name2 = course_name_2.lower().strip()
+
+        # Match exato
+        if name1 == name2:
+            return True
+
+        # Match parcial (um contém o outro)
+        if name1 in name2 or name2 in name1:
+            return True
+
+        return False
+
+
+# ============================================================================
+# HELPER FUNCTIONS PARA RASTREAMENTO
+# ============================================================================
+
+def calculate_file_download_time(file_size_bytes: int, duration_seconds: float) -> str:
+    """Calcula o tempo de download formatado."""
+    hours = int(duration_seconds // 3600)
+    minutes = int((duration_seconds % 3600) // 60)
+    seconds = int(duration_seconds % 60)
+
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def get_file_type(filename: str) -> str:
+    """Obtém tipo de arquivo baseado na extensão."""
+    extension = os.path.splitext(filename)[1].lower().lstrip('.')
+
+    type_map = {
+        'pdf': 'pdf',
+        'mp4': 'video',
+        'mkv': 'video',
+        'avi': 'video',
+        'txt': 'text',
+        'md': 'text',
+        'png': 'image',
+        'jpg': 'image',
+        'jpeg': 'image',
+        'gif': 'image',
+        'zip': 'archive',
+        'rar': 'archive',
+        '7z': 'archive'
+    }
+
+    return type_map.get(extension, 'unknown')
+
+
+def download_file_with_tracking(url: str, file_path: str, manifest_manager: FileManifestManager,
+                                lesson_title: str, current_page_url: str = None,
+                                logger: logging.Logger = None) -> bool:
+    """
+    Versão modificada de download_file com rastreamento automático.
+
+    Args:
+        url (str): URL do arquivo
+        file_path (str): Caminho onde salvar
+        manifest_manager (FileManifestManager): Gerenciador do manifesto
+        lesson_title (str): Título da aula para rastreamento
+        current_page_url (str): URL da página atual (para Referer header)
+        logger (logging.Logger): Logger para registrar eventos
+
+    Returns:
+        bool: True se sucesso, False caso contrário
+    """
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+    }
+    if current_page_url:
+        headers['Referer'] = current_page_url
+
+    download_start = datetime.now()
+
+    try:
+        with requests.get(url, stream=True, timeout=60, headers=headers) as response:
+            response.raise_for_status()
+            total = response.headers.get('content-length')
+            total = int(total) if total else None
+            downloaded = 0
+
+            with open(file_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        if total:
+                            downloaded += len(chunk)
+                            progress = 100 * downloaded / total
+                            print(f"\r  Baixando: {os.path.basename(file_path)} [{progress:.2f}%]", end="")
+
+            print()
+
+            # NOVO: Rastrear arquivo no manifesto
+            download_duration = (datetime.now() - download_start).total_seconds()
+            download_time_str = calculate_file_download_time(total or 0, download_duration)
+            file_type = get_file_type(file_path)
+
+            manifest_manager.add_file(
+                lesson_title=lesson_title,
+                file_name=os.path.basename(file_path),
+                size_bytes=total or os.path.getsize(file_path),
+                file_type=file_type,
+                download_time=download_time_str,
+                status="success"
+            )
+
+            if logger:
+                logger.info(f"Arquivo rastreado: {os.path.basename(file_path)}")
+
+            return True
+
+    except Exception as e:
+        print(f"Erro ao baixar: {e}")
+
+        # NOVO: Registrar erro no manifesto
+        manifest_manager.add_file(
+            lesson_title=lesson_title,
+            file_name=os.path.basename(file_path),
+            size_bytes=0,
+            file_type=get_file_type(file_path),
+            download_time="00:00:00",
+            status="error"
+        )
+
+        if logger:
+            logger.error(f"Erro ao baixar {file_path}: {e}")
+
+        return False
 
 
 # ============================================================================
@@ -213,7 +730,7 @@ class TelegramLoggingHandler(logging.Handler):
         Apenas logs de nível WARNING ou superior são enviados.
         """
         try:
-            if record.levelno >= logging.WARNING:  # Apenas WARNING, ERROR, CRITICAL
+            if record.levelno >= logging.WARNING:
                 emoji = self.emoji_map.get(record.levelname, '📝')
                 message = (
                     f"{emoji} <b>{record.levelname}</b>\n\n"
@@ -364,26 +881,26 @@ def is_logged_in(driver):
         bool: True se logado, False caso contrário
     """
     try:
-        # Tenta encontrar um elemento que só existe quando está logado
-        # Ajuste o seletor conforme necessário para a plataforma
         driver.find_element(By.CSS_SELECTOR, "a[href*='dashboard']")
         return True
     except NoSuchElementException:
         return False
 
 
-def ensure_logged_in(driver, cookies_file=COOKIES_FILE):
+def ensure_logged_in(driver, telegram, cookies_file=COOKIES_FILE):
     """
     Garante que está logado, restaurando cookies se a sessão expirou.
 
     Args:
         driver: WebDriver do Selenium
+        telegram: Notificador do Telegram
         cookies_file: Arquivo de cookies para restaurar sessão
 
     Returns:
         bool: True se logado ou restaurado com sucesso, False caso contrário
     """
     if not is_logged_in(driver):
+        telegram.notify_session_expired()
         print("\n⚠ Sessão expirada detectada. Tentando restaurar...")
         driver.get(BASE_URL)
         time.sleep(2)
@@ -393,6 +910,7 @@ def ensure_logged_in(driver, cookies_file=COOKIES_FILE):
             time.sleep(3)
 
             if is_logged_in(driver):
+                telegram.notify_session_restored()
                 print("✓ Sessão restaurada com sucesso!")
                 return True
             else:
@@ -404,6 +922,7 @@ def ensure_logged_in(driver, cookies_file=COOKIES_FILE):
         else:
             print("✗ Não foi possível carregar cookies.")
             return False
+
     return True
 
 
@@ -558,6 +1077,7 @@ def setup_course_logger(course_title, download_dir, telegram_notifier):
     Args:
         course_title (str): Nome do curso
         download_dir (str): Diretório raiz de downloads
+        telegram_notifier: Notificador do Telegram
 
     Returns:
         logging.Logger: Logger configurado para o curso
@@ -578,7 +1098,7 @@ def setup_course_logger(course_title, download_dir, telegram_notifier):
 # FUNÇÕES REFATORADAS PARA DOWNLOAD DE MATERIAIS
 # ============================================================================
 
-def save_lesson_subjects(lesson_download_path, lesson_subtitle, logger):
+def save_lesson_subjects(lesson_download_path, lesson_subtitle, logger, manifest_manager=None, lesson_title=""):
     """Salva os assuntos da aula em arquivo texto."""
     if not lesson_subtitle:
         return True
@@ -594,6 +1114,17 @@ def save_lesson_subjects(lesson_download_path, lesson_subtitle, logger):
             f.write(lesson_subtitle)
         print("Arquivo 'Assuntos_dessa_aula.txt' criado com sucesso.")
         logger.info("Arquivo 'Assuntos_dessa_aula.txt' criado com sucesso.")
+
+        # ADICIONAR ESTAS LINHAS:
+        if manifest_manager:
+            manifest_manager.add_file(
+                lesson_title=lesson_title,
+                file_name="Assuntos_dessa_aula.txt",
+                size_bytes=len(lesson_subtitle.encode('utf-8')),
+                file_type="text",
+                download_time="00:00:00",
+                status="success"
+            )
         return True
     except Exception as e:
         print(f"Erro ao criar 'Assuntos_dessa_aula.txt': {e}")
@@ -601,7 +1132,7 @@ def save_lesson_subjects(lesson_download_path, lesson_subtitle, logger):
         return False
 
 
-def download_electronic_books(driver, lesson_download_path, sanitized_lesson_title, logger):
+def download_electronic_books(driver, lesson_download_path, sanitized_lesson_title, logger, manifest_manager, lesson_title):
     """Localiza e baixa os Livros Eletrônicos (PDFs) da aula."""
     print("Procurando por Livros Eletrônicos (PDFs)...")
     try:
@@ -635,7 +1166,7 @@ def download_electronic_books(driver, lesson_download_path, sanitized_lesson_tit
             else:
                 print(f"Encontrado PDF: {pdf_text_raw}")
                 logger.info(f"Iniciando download do PDF: {filename}")
-                download_file(pdf_url, full_file_path, driver.current_url, logger)
+                download_file_with_tracking(pdf_url, full_file_path, manifest_manager, lesson_title, driver.current_url, logger)
     except Exception as e:
         print(f"Erro ao processar Livros Eletrônicos: {e}")
         logger.error(f"Erro ao processar Livros Eletrônicos: {e}")
@@ -672,7 +1203,7 @@ def get_playlist_videos(driver, logger):
         return []
 
 
-def download_video_supplementary_pdfs(driver, video_info, lesson_download_path, sanitized_lesson_title, index, logger):
+def download_video_supplementary_pdfs(driver, video_info, lesson_download_path, sanitized_lesson_title, index, logger, manifest_manager, lesson_title):
     """Baixa os PDFs suplementares de um vídeo (Resumo, Slides, Mapa Mental)."""
     print(f"Procurando por PDFs suplementares do vídeo '{video_info['title']}'...")
 
@@ -698,7 +1229,7 @@ def download_video_supplementary_pdfs(driver, video_info, lesson_download_path, 
                 else:
                     print(f"Encontrado {pdf_button_text} para o vídeo '{video_info['title']}'.")
                     logger.info(f"Iniciando download: {pdf_button_text}")
-                    download_file(pdf_url, full_file_path, driver.current_url, logger)
+                    download_file_with_tracking(pdf_url, full_file_path, manifest_manager, lesson_title, driver.current_url, logger)
             else:
                 logger.warning(f"{pdf_button_text} encontrado mas sem URL para '{video_info['title']}'")
         except NoSuchElementException:
@@ -709,7 +1240,7 @@ def download_video_supplementary_pdfs(driver, video_info, lesson_download_path, 
             logger.error(f"Erro ao processar '{pdf_button_text}': {e}")
 
 
-def download_video_file(driver, video_info, lesson_download_path, sanitized_video_title, logger):
+def download_video_file(driver, video_info, lesson_download_path, sanitized_video_title, logger, manifest_manager, lesson_title):
     """Baixa o arquivo de vídeo em uma qualidade preferida (720p > 480p > 360p)."""
     try:
         download_options_header = WebDriverWait(driver, 10).until(
@@ -743,7 +1274,7 @@ def download_video_file(driver, video_info, lesson_download_path, sanitized_vide
                 print(f"Tentando baixar vídeo em {quality}...")
                 logger.info(f"Iniciando download em {quality}")
 
-                if download_file(video_url, full_file_path, driver.current_url, logger):
+                if download_file_with_tracking(video_url, full_file_path, manifest_manager, lesson_title, driver.current_url, logger):
                     return True
             except NoSuchElementException:
                 print(f"Qualidade {quality} não disponível. Tentando próxima...")
@@ -764,7 +1295,7 @@ def download_video_file(driver, video_info, lesson_download_path, sanitized_vide
         return False
 
 
-def download_playlist_videos(driver, videos_list, lesson_download_path, sanitized_lesson_title, logger):
+def download_playlist_videos(driver, videos_list, lesson_download_path, sanitized_lesson_title, logger, manifest_manager, lesson_title):
     """Orquestra o download de todos os vídeos da playlist."""
     print(f"Iniciando download de {len(videos_list)} vídeos...")
     logger.info(f"Iniciando download de {len(videos_list)} vídeos.")
@@ -777,10 +1308,10 @@ def download_playlist_videos(driver, videos_list, lesson_download_path, sanitize
         time.sleep(2)
 
         download_video_supplementary_pdfs(driver, video_info, lesson_download_path,
-                                          sanitized_lesson_title, i, logger)
+                                          sanitized_lesson_title, i, logger, manifest_manager, lesson_title)
 
         sanitized_video_title = sanitize_filename(video_info['title'])
-        download_video_file(driver, video_info, lesson_download_path, sanitized_video_title, logger)
+        download_video_file(driver, video_info, lesson_download_path, sanitized_video_title, logger, manifest_manager, lesson_title)
 
 
 def navigate_to_lesson(driver, lesson_url, logger):
@@ -818,10 +1349,11 @@ def create_lesson_directory(download_dir, course_title, lesson_title, logger):
         return None
 
 
-def download_lesson_materials(driver, lesson_info, course_title, download_dir, logger):
+def download_lesson_materials(driver, lesson_info, course_title, download_dir, logger, manifest_manager):
     """
     Orquestra o download de todos os materiais de uma aula.
     Função refatorada - apenas coordena as subfunções especializadas.
+    NOVO: Integrado com rastreamento de arquivos via manifest.
     """
     lesson_title = lesson_info['title']
     lesson_subtitle = lesson_info['subtitle']
@@ -829,6 +1361,9 @@ def download_lesson_materials(driver, lesson_info, course_title, download_dir, l
 
     print(f"Processando aula: {lesson_title}")
     logger.info(f"Iniciando processamento da aula: {lesson_title}")
+
+    # Inicia rastreamento da aula
+    manifest_manager.start_lesson(lesson_title)
 
     if not navigate_to_lesson(driver, lesson_url, logger):
         return
@@ -839,15 +1374,17 @@ def download_lesson_materials(driver, lesson_info, course_title, download_dir, l
     if not lesson_download_path:
         return
 
-    save_lesson_subjects(lesson_download_path, lesson_subtitle, logger)
+    save_lesson_subjects(lesson_download_path, lesson_subtitle, logger, manifest_manager, lesson_title)
 
     sanitized_lesson_title = sanitize_filename(lesson_title)
-    download_electronic_books(driver, lesson_download_path, sanitized_lesson_title, logger)
+    download_electronic_books(driver, lesson_download_path, sanitized_lesson_title, logger, manifest_manager, lesson_title)
 
     videos_list = get_playlist_videos(driver, logger)
     if videos_list:
-        download_playlist_videos(driver, videos_list, lesson_download_path, sanitized_lesson_title, logger)
+        download_playlist_videos(driver, videos_list, lesson_download_path, sanitized_lesson_title, logger, manifest_manager, lesson_title)
 
+    # Finaliza rastreamento da aula
+    manifest_manager.finish_lesson(lesson_title)
     logger.info(f"Aula '{lesson_title}' processada com sucesso.")
 
 
@@ -886,7 +1423,69 @@ def pick_courses(courses):
                 return [courses[idx] for idx in indices]
         except Exception:
             pass
+
         print("Seleção inválida. Tente novamente.")
+
+
+def check_pending_lessons(driver, download_dir, courses, telegram):
+    """
+    FEATURE #2: Verifica cursos já baixados e oferece completar aulas pendentes.
+
+    Args:
+        download_dir: Diretório raiz de downloads
+        courses: Cursos disponíveis na plataforma
+        telegram: Notificador do Telegram
+
+    Returns:
+        Nenhum valor - apenas exibe informações e oferece ao usuário
+    """
+    detector = PendingLessonsDetector(download_dir)
+    downloaded_courses = detector.scan_downloaded_courses()
+
+    if not downloaded_courses:
+        print("\n✓ Nenhum curso baixado ainda.")
+        return [], {}  # ✅ Retorna listas vazias
+
+    print(f"\n{'=' * 60}")
+    print(f"🔍 Verificando cursos já baixados...")
+    print(f"{'=' * 60}")
+    print(f"\n✓ Encontrados {len(downloaded_courses)} cursos baixados anteriormente:\n")
+
+    courses_map = {course['title']: course for course in courses}
+    incomplete_courses = []
+
+    # Listar cursos e suas aulas
+    for course_name, course_path in downloaded_courses.items():
+        lessons = detector.get_course_downloaded_lessons(course_path)
+        manifest_path = os.path.join(course_path, FileManifestManager.MANIFEST_FILENAME)
+
+        if os.path.exists(manifest_path):
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                manifest = json.load(f)
+            stats = FileManifestManager(course_path).get_course_statistics()
+
+            print(f"  📚 {course_name}")
+            print(f"  ├─ 📖 {len(lessons)} aulas")
+            print(f"  ├─ 📁 {stats['total_files']} arquivos")
+            print(f"  └─ 💾 {stats['total_size_gb']} GB\n")
+
+            # Procura pelo curso correspondente na plataforma
+            for platform_course in courses:
+                if detector._courses_match(course_name, platform_course['title']):
+                    # Marcar como incompleto se tiver menos aulas que na plataforma
+                    # Você pode ajustar essa lógica conforme necessário
+                    incomplete_courses.append(platform_course)
+                    break
+        else:
+            print(f"  📚 {course_name}")
+            print(f"  └─ {len(lessons)} aulas (sem manifest)\n")
+
+        telegram.send(f"📚 <b>{course_name}</b>\n{len(lessons)} aulas já baixadas")
+
+    print(f"{'=' * 60}\n")
+
+    # ✅ Retornar cursos incompletos para priorizar
+    return incomplete_courses, courses_map
 
 
 def run_downloader(download_dir, login_wait_time):
@@ -897,10 +1496,13 @@ def run_downloader(download_dir, login_wait_time):
     1. Heartbeat para manter sessão viva durante downloads longos
     2. Salvamento e restauração automática de cookies
     3. Verificação de sessão antes de processar cada curso
+    4. NOVO: Rastreamento de arquivos baixados em JSON (Feature #1)
+    5. NOVO: Detecção de cursos com aulas pendentes (Feature #2)
     """
 
     # Inicializa notificador do Telegram
     telegram = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_ENABLED)
+
     try:
         os.makedirs(download_dir, exist_ok=True)
         print(f"Diretório de download configurado para: {os.path.abspath(download_dir)}")
@@ -911,13 +1513,13 @@ def run_downloader(download_dir, login_wait_time):
     driver = webdriver.Edge()
     driver.maximize_window()
 
-    # MELHORIA #2: Inicializa sistema de heartbeat
+    # Inicializa sistema de heartbeat
     keepalive = SessionKeepAlive(driver, interval=HEARTBEAT_INTERVAL)
 
     try:
         login(driver, login_wait_time)
 
-        # MELHORIA #2: Inicia heartbeat após login
+        # Inicia heartbeat após login
         keepalive.start()
 
         courses = get_course_data(driver)
@@ -925,11 +1527,47 @@ def run_downloader(download_dir, login_wait_time):
             print("Nenhum curso encontrado. Encerrando.")
             return
 
-        selected_courses = pick_courses(courses)
+        # FEATURE #2: Verificar cursos já baixados e aulas pendentes
+        incomplete_courses, courses_map = check_pending_lessons(driver, download_dir, courses, telegram)
+
+        # Se houver cursos incompletos, oferecer ao usuário completá-los PRIMEIRO
+        if incomplete_courses:
+            print(f"\n{'=' * 70}")
+            print(f"⚠️  ENCONTRADOS {len(incomplete_courses)} CURSO(S) COM AULAS FALTANDO!")
+            print(f"{'=' * 70}\n")
+
+            print("Cursos a serem completados:\n")
+            for idx, info in enumerate(incomplete_courses, 1):
+                course = info['course']
+                print(f"  [{idx}] {course['title']}")
+                print(f"      ├─ Aulas locais: {info['local_total']}/{info['platform_total']}")
+                print(f"      ├─ Faltam: {info['missing']} aulas")
+                print(f"      └─ Progresso: {info['progress']}\n")
+
+            print()
+            choice = input("Deseja COMPLETAR esses cursos agora? (s/n): ").strip().lower()
+
+            if choice == 's':
+                print("\n✓ Iniciando download de aulas PENDENTES...")
+                # Extrair apenas o objeto de curso (sem informações extras)
+                selected_courses = [info['course'] for info in incomplete_courses]
+                telegram.send(
+                    f"🔄 <b>COMPLETANDO CURSOS INCOMPLETOS</b>\n"
+                    f"Total de cursos: {len(incomplete_courses)}\n"
+                    f"Aulas faltando: {sum(info['missing'] for info in incomplete_courses)}"
+                )
+            else:
+                print("\n▶️  Oferecendo novo download de cursos...")
+                selected_courses = pick_courses(courses)
+        else:
+            # Nenhum curso incompleto, oferecer novo download
+            print("\n✓ Nenhum curso com aulas faltando. Oferecendo novo download...\n")
+            selected_courses = pick_courses(courses)
+
         telegram.notify_start(len(selected_courses))
 
         for i, course in enumerate(selected_courses):
-            # MELHORIA #3: Verifica e restaura sessão antes de cada curso
+            # Verifica e restaura sessão antes de cada curso
             print(f"\n{'=' * 60}")
             print(f"Verificando sessão antes de processar curso {i + 1}/{len(selected_courses)}...")
             if not ensure_logged_in(driver, telegram):
@@ -942,6 +1580,11 @@ def run_downloader(download_dir, login_wait_time):
             logger.info(f"Iniciando download do curso: {course['title']}")
             logger.info("=" * 60)
 
+            # FEATURE #1: Inicializar gerenciador de manifesto para este curso
+            course_download_path = os.path.join(download_dir, sanitize_filename(course['title']))
+            os.makedirs(course_download_path, exist_ok=True)
+            manifest_manager = FileManifestManager(course_download_path, logger)
+
             start_time = datetime.now()
 
             lessons = get_lesson_data(driver, course['url'])
@@ -950,26 +1593,38 @@ def run_downloader(download_dir, login_wait_time):
                 logger.warning("Nenhuma aula encontrada para este curso.")
                 continue
 
-            telegram.notify_course_start(course['title'], i+1, len(selected_courses), len(lessons))
-
+            telegram.notify_course_start(course['title'], i + 1, len(selected_courses), len(lessons))
 
             for j, lesson_info in enumerate(lessons):
                 print(f"\n -> Aula {j + 1}/{len(lessons)}: {lesson_info['title']}")
                 logger.info(f"Processando aula {j + 1}/{len(lessons)}: {lesson_info['title']}")
-                download_lesson_materials(driver, lesson_info, course['title'], download_dir, logger)
+                # FEATURE #1: Passar manifest_manager para download_lesson_materials
+                download_lesson_materials(driver, lesson_info, course['title'], download_dir, logger, manifest_manager)
+                telegram.notify_lesson_progress(j + 1, len(lessons), lesson_info['title'])
                 time.sleep(2)
 
             end_time = datetime.now()
             delta = end_time - start_time
-            telegram.notify_complete(str(delta))
+
+            # FEATURE #1: Exibir estatísticas do manifesto
+            stats = manifest_manager.get_course_statistics()
+            print(f"\n📊 Estatísticas do Curso:")
+            print(f"   ├─ Aulas processadas: {stats['total_lessons']}")
+            print(f"   ├─ Arquivos baixados: {stats['total_files']}")
+            print(f"   └─ Tamanho total: {stats['total_size_gb']} GB")
+
+            telegram.notify_course_complete(course['title'], i + 1, len(selected_courses), str(delta))
             logger.info(f"Download do curso finalizado. Tempo total: {delta}")
             print(f"\n✓ Tempo de download do curso: {delta}")
+
+        total_time = datetime.now() - (datetime.now() - (end_time - start_time) * len(selected_courses))
+        telegram.notify_complete(str(delta))
 
     except Exception as e:
         telegram.notify_error(str(e))
         print(f"\nErro geral no script: {e}")
     finally:
-        # MELHORIA #2: Para heartbeat antes de encerrar
+        # Para heartbeat antes de encerrar
         keepalive.stop()
         print("\nProcesso concluído. Fechando navegador em 10 segundos.")
         time.sleep(10)
@@ -979,7 +1634,7 @@ def run_downloader(download_dir, login_wait_time):
 def main():
     """Analisa argumentos de linha de comando e inicia o processo."""
     parser = argparse.ArgumentParser(
-        description="Baixador de cursos do Estratégia Concursos com gerenciamento de sessão.",
+        description="Baixador de cursos do Estratégia Concursos com gerenciamento de sessão e rastreamento.",
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument(
@@ -987,11 +1642,12 @@ def main():
         dest='download_dir',
         metavar='PATH',
         type=str,
-        default="C:/Users/joao.santosm/projetos/curso/TJ-RJ",
-        help="O caminho para a pasta onde os cursos serão salvos.\n(Padrão: E:/Estrategia)"
+        default="C:/Users/joao.santosm/projetos/curso/CGU (Auditor - Área Tecnologia da Informação) Pacotaço - Pacote Teórico + Pacote Passo Estratégico",
+        help="O caminho para a pasta onde os cursos serão salvos.\n(Padrão: C:/Users/joao.santosm/projetos/curso/TJ-RJ)"
     )
     parser.add_argument(
         "-w", "--wait-time",
+        dest='wait_time',
         type=int,
         default=60,
         help="Tempo em segundos para aguardar o login manual (padrão: 60)."
