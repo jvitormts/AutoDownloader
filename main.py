@@ -177,7 +177,7 @@ class FileManifestManager:
 # FEATURE 2: DETECTOR DE PENDENTES
 # ============================================================================
 
-def find_incomplete_courses(driver, download_dir, available_courses, telegram):
+def find_incomplete_courses(driver, download_dir, available_courses, telegram, logger=None):
     """
     Detecta cursos incompletos comparando:
     - Total de aulas na PLATAFORMA
@@ -203,12 +203,12 @@ def find_incomplete_courses(driver, download_dir, available_courses, telegram):
         ]
     """
 
-    detector = PendingLessonsDetector(download_dir)
+    detector = PendingLessonsDetector(download_dir, logger)
     downloaded_courses = detector.scan_downloaded_courses()
 
     if not downloaded_courses:
         print("\n✓ Nenhum curso baixado ainda.")
-        return []
+        return [], {}  # ✅ RETORNA TUPLA COM 2 VALORES
 
     print(f"\n{'=' * 70}")
     print(f"🔍 ANALISANDO PROGRESSO DOS CURSOS...")
@@ -230,15 +230,27 @@ def find_incomplete_courses(driver, download_dir, available_courses, telegram):
         else:
             stats = {'total_lessons': local_total, 'total_size_gb': 0}
 
-        # Procurar curso correspondente na plataforma
+        # ✅ Procurar curso correspondente na plataforma
         platform_course = None
         platform_total = 0
 
+        # Tentar obter nome original do arquivo metadata.json
+        metadata_path = os.path.join(local_course_path, "course_metadata.json")
+        original_course_name = local_course_name
+
+        if os.path.exists(metadata_path):
+            try:
+                with open(metadata_path, 'r', encoding='utf-8') as f:
+                    metadata = json.load(f)
+                    original_course_name = metadata.get('original_title', local_course_name)
+                    print(f"  ℹ️  Nome original encontrado: {original_course_name}")
+            except Exception as e:
+                print(f"  ⚠️  Erro ao ler metadata: {e}")
+
         for course in available_courses:
-            if detector._courses_match(local_course_name, course['title']):
+            # Usar nome original se disponível no metadata
+            if detector._courses_match(original_course_name, course['title'], metadata_path):
                 platform_course = course
-                # Aqui você precisa acessar a plataforma para contar aulas
-                # Para agora, vamos obter via navegação
                 platform_total = get_total_lessons_from_platform(driver, course['url'], telegram)
                 break
 
@@ -264,14 +276,17 @@ def find_incomplete_courses(driver, download_dir, available_courses, telegram):
 
             incomplete.append(course_info)
 
-            print(f"  📚 {local_course_name}")
-            print(f"  ├─ 📊 Progresso: {local_total}/{platform_total} aulas ({progress_pct:.1f}%)")
-            print(f"  ├─ ❌ Faltam: {missing} aulas")
-            print(f"  ├─ 💾 Tamanho: {stats.get('total_size_gb', 0)} GB")
-            print(f"  └─ 🔗 Status: INCOMPLETO\n")
+            # ✅ Exibir nome original se disponível
+            display_name = original_course_name if os.path.exists(metadata_path) else local_course_name
+
+            print(f" 📚 {display_name}")
+            print(f" ├─ 📊 Progresso: {local_total}/{platform_total} aulas ({progress_pct:.1f}%)")
+            print(f" ├─ ❌ Faltam: {missing} aulas")
+            print(f" ├─ 💾 Tamanho: {stats.get('total_size_gb', 0)} GB")
+            print(f" └─ 🔗 Status: INCOMPLETO\n")
 
             telegram.send(
-                f"📚 <b>{local_course_name}</b>\n"
+                f"📚 <b>{display_name}</b>\n"
                 f"Progresso: {local_total}/{platform_total} ({progress_pct:.1f}%)\n"
                 f"Faltam: {missing} aulas"
             )
@@ -296,7 +311,8 @@ def find_incomplete_courses(driver, download_dir, available_courses, telegram):
     else:
         print(f"\n✅ Todos os cursos estão completos!\n")
 
-    return incomplete
+    courses_map = {course['title']: course for course in available_courses}
+    return incomplete, courses_map
 
 
 def get_total_lessons_from_platform(driver, course_url, telegram):
@@ -359,7 +375,7 @@ class PendingLessonsDetector:
             logger (logging.Logger): Logger para registrar ações
         """
         self.base_path = download_base_path
-        self.logger = logger
+        self.logger = logger if logger else logging.getLogger(__name__)
 
     def scan_downloaded_courses(self) -> dict:
         """
@@ -422,17 +438,54 @@ class PendingLessonsDetector:
                 self.logger.error(f"Erro ao listar aulas: {e}")
             return []
 
-    def _courses_match(self, course_name_1: str, course_name_2: str) -> bool:
-        """Verifica se dois nomes de curso referem-se ao mesmo curso."""
-        name1 = course_name_1.lower().strip()
-        name2 = course_name_2.lower().strip()
+    def _courses_match(self, course_name_1: str, course_name_2: str, metadata_path: str = None) -> bool:
+        """
+        Verifica se dois nomes de curso referem-se ao mesmo curso.
+        Agora suporta matching com metadata.json para nomes mais precisos.
 
-        # Match exato
-        if name1 == name2:
+        Args:
+            course_name_1: Nome local (pode ser sanitizado)
+            course_name_2: Nome da plataforma
+            metadata_path: Caminho para arquivo course_metadata.json (opcional)
+
+        Returns:
+            bool: True se cursos match, False caso contrário
+        """
+        name1_lower = course_name_1.lower().strip()
+        name2_lower = course_name_2.lower().strip()
+
+        # ✅ 1. Se temos metadata.json, usar nome original salvo
+        if metadata_path and os.path.exists(metadata_path):
+            try:
+                with open(metadata_path, 'r', encoding='utf-8') as f:
+                    metadata = json.load(f)
+                    original_title = metadata.get('original_title', '').lower().strip()
+
+                    if original_title == name2_lower:
+                        if self.logger:
+                            self.logger.debug(f"Match via metadata: {original_title} == {name2_lower}")
+                        return True
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(f"Erro ao ler metadata: {e}")
+
+        # 2. Match exato (caso nenhum tenha caracteres especiais)
+        if name1_lower == name2_lower:
             return True
 
-        # Match parcial (um contém o outro)
-        if name1 in name2 or name2 in name1:
+        # 3. Match fuzzy: remover caracteres especiais de ambos e comparar
+        # "CGU - Português" → "cgu português"
+        # "CGU_Português" → "cgu português"
+        name1_normalized = re.sub(r'[^a-z0-9\s]', '', name1_lower)
+        name2_normalized = re.sub(r'[^a-z0-9\s]', '', name2_lower)
+
+        if name1_normalized == name2_normalized:
+            if self.logger:
+                self.logger.debug(f"Match fuzzy: '{name1_lower}' ≈ '{name2_lower}'")
+            return True
+
+        # 4. Match parcial (um contém o outro) - para casos extremos
+        if name1_lower in name2_lower or name2_lower in name1_lower:
             return True
 
         return False
@@ -1332,7 +1385,36 @@ def navigate_to_lesson(driver, lesson_url, logger):
         print(f"Erro ao navegar para aula: {e}")
         logger.error(f"Erro ao navegar para aula: {e}")
         return False
+def save_course_metadata(course_path, original_title, logger=None):
+    """
+    Salva metadados do curso em JSON para facilitar matching posterior.
 
+    Args:
+        course_path: Caminho da pasta do curso (sanitizado)
+        original_title: Nome original do curso conforme plataforma
+        logger: Logger para registrar eventos
+    """
+    metadata_path = os.path.join(course_path, "course_metadata.json")
+
+    # Se já existe, não sobrescreve
+    if os.path.exists(metadata_path):
+        return
+
+    try:
+        metadata = {
+            "original_title": original_title,
+            "download_date": datetime.now().isoformat(),
+            "sanitized_title": os.path.basename(course_path)
+        }
+
+        with open(metadata_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+        if logger:
+            logger.info(f"Metadados do curso salvos: {original_title}")
+    except Exception as e:
+        if logger:
+            logger.warning(f"Erro ao salvar metadados: {e}")
 
 def create_lesson_directory(download_dir, course_title, lesson_title, logger):
     """Cria o diretório para a aula."""
@@ -1342,6 +1424,13 @@ def create_lesson_directory(download_dir, course_title, lesson_title, logger):
 
     try:
         os.makedirs(lesson_download_path, exist_ok=True)
+
+        # ✅ NOVO: Salvar metadata do curso na pasta principal
+        save_course_metadata(
+            os.path.join(download_dir, sanitized_course_title),
+            course_title,
+            logger
+        )
         return lesson_download_path
     except OSError as e:
         print(f"ERRO CRÍTICO ao criar diretório: {e}")
@@ -1411,20 +1500,45 @@ def login(driver, wait_time):
 
 def pick_courses(courses):
     """Lista os cursos e permite seleção interativa."""
+    if not courses:
+        print("❌ Nenhum curso disponível para seleção.")
+        return []
+
     print("\nCURSOS DISPONÍVEIS:")
     for idx, course in enumerate(courses, 1):
         print(f" [{idx}] {course['title']}")
 
     while True:
-        sel = input("\nDigite os números dos cursos a baixar (ex: 1,3,5): ")
         try:
-            indices = [int(x.strip()) - 1 for x in sel.split(",") if x.strip().isdigit()]
-            if all(0 <= idx < len(courses) for idx in indices) and indices:
-                return [courses[idx] for idx in indices]
-        except Exception:
-            pass
+            sel = input("\nDigite os números dos cursos a baixar (ex: 1,3,5): ").strip()
 
-        print("Seleção inválida. Tente novamente.")
+            # Verificar entrada vazia
+            if not sel:
+                print("⚠️  Por favor, digite pelo menos um número.")
+                continue
+
+            # Parsear índices
+            indices = []
+            for x in sel.split(","):
+                x = x.strip()
+                if x.isdigit():
+                    idx = int(x) - 1
+                    if 0 <= idx < len(courses):
+                        indices.append(idx)
+                    else:
+                        print(f"⚠️  Número {int(x)} fora do intervalo [1-{len(courses)}]")
+
+            # Validar se há índices válidos
+            if indices:
+                selected = [courses[idx] for idx in indices]
+                print(f"\n✓ Selecionados {len(selected)} curso(s)")
+                return selected
+            else:
+                print("⚠️  Nenhum número válido foi selecionado. Tente novamente.")
+
+        except Exception as e:
+            print(f"⚠️  Erro ao processar entrada: {e}")
+            print("   Tente novamente (ex: 1,3,5)")
 
 
 def check_pending_lessons(driver, download_dir, courses, telegram):
@@ -1527,11 +1641,19 @@ def run_downloader(download_dir, login_wait_time):
             print("Nenhum curso encontrado. Encerrando.")
             return
 
-        # FEATURE #2: Verificar cursos já baixados e aulas pendentes
-        incomplete_courses, courses_map = check_pending_lessons(driver, download_dir, courses, telegram)
+        # FEATURE #2 MELHORADA: Verificar cursos já baixados e detectar aulas FALTANTES
+        try:
+            incomplete_courses, courses_map = find_incomplete_courses(
+                driver, download_dir, courses, telegram
+            )
+        except ValueError as e:
+            logger.error(f"Erro ao detectar cursos incompletos: {e}")
+            telegram.send(f"❌ Erro ao detectar cursos: {e}")
+            incomplete_courses = []
+            courses_map = {}
 
         # Se houver cursos incompletos, oferecer ao usuário completá-los PRIMEIRO
-        if incomplete_courses:
+        if incomplete_courses and len(incomplete_courses) > 0:
             print(f"\n{'=' * 70}")
             print(f"⚠️  ENCONTRADOS {len(incomplete_courses)} CURSO(S) COM AULAS FALTANDO!")
             print(f"{'=' * 70}\n")
@@ -1563,6 +1685,14 @@ def run_downloader(download_dir, login_wait_time):
             # Nenhum curso incompleto, oferecer novo download
             print("\n✓ Nenhum curso com aulas faltando. Oferecendo novo download...\n")
             selected_courses = pick_courses(courses)
+
+        # ✅ Validar se há cursos selecionados
+        if not selected_courses:
+            print("❌ Nenhum curso foi selecionado.")
+            print("Encerrando execução.")
+            telegram.send("⚠️ Nenhum curso foi selecionado. Execução encerrada.")
+            return
+
 
         telegram.notify_start(len(selected_courses))
 
