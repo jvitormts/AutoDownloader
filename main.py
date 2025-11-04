@@ -14,9 +14,14 @@ import sys
 import logging
 from pathlib import Path
 
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+
 from config import settings
 from notifications import TelegramNotifier, setup_logger
-from core import SessionKeepAlive, save_cookies, load_cookies, is_logged_in
+from core import SessionKeepAlive, save_cookies, load_cookies, is_logged_in, CourseDownloader
 from services import FileManifestManager, FileDownloader
 from detectors import PendingLessonsDetector
 
@@ -75,6 +80,12 @@ Exemplos de uso:
     )
 
     parser.add_argument(
+        '--headless',
+        action='store_true',
+        help='Executar navegador em modo headless (sem interface)'
+    )
+
+    parser.add_argument(
         '--version',
         action='version',
         version='%(prog)s 2.0.0'
@@ -96,6 +107,76 @@ def validate_environment():
         print(f"❌ Erro de configuração: {e}")
         print("\n💡 Dica: Verifique o arquivo .env e configure as variáveis necessárias")
         sys.exit(1)
+
+
+def setup_webdriver(headless: bool = False) -> webdriver.Chrome:
+    """
+    Configura e retorna o WebDriver do Chrome.
+
+    Args:
+        headless: Se True, executa em modo headless
+
+    Returns:
+        webdriver.Chrome: WebDriver configurado
+    """
+    chrome_options = Options()
+
+    if headless:
+        chrome_options.add_argument('--headless')
+
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.add_argument(f'user-agent={settings.USER_AGENT}')
+
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+
+    return driver
+
+
+def pick_courses(courses: list) -> list:
+    """
+    Permite ao usuário selecionar cursos para download.
+
+    Args:
+        courses: Lista de cursos disponíveis
+
+    Returns:
+        list: Cursos selecionados
+    """
+    print(f"\n{'=' * 70}")
+    print("📚 CURSOS DISPONÍVEIS")
+    print(f"{'=' * 70}\n")
+
+    for i, course in enumerate(courses, 1):
+        print(f"{i}. {course['title']}")
+
+    print(f"\n{len(courses) + 1}. Baixar TODOS os cursos")
+    print("0. Sair")
+
+    while True:
+        try:
+            choice = input("\n👉 Escolha uma opção: ").strip()
+
+            if choice == '0':
+                print("Saindo...")
+                sys.exit(0)
+
+            choice_num = int(choice)
+
+            if choice_num == len(courses) + 1:
+                return courses
+
+            if 1 <= choice_num <= len(courses):
+                return [courses[choice_num - 1]]
+
+            print("❌ Opção inválida. Tente novamente.")
+
+        except ValueError:
+            print("❌ Digite um número válido.")
+        except KeyboardInterrupt:
+            print("\n\nInterrompido pelo usuário.")
+            sys.exit(0)
 
 
 def main():
@@ -163,20 +244,77 @@ def main():
 
     # Modo normal de download
     logger.info("Modo: Download de cursos")
-    print("\n⚠️  ATENÇÃO:")
-    print("Esta é uma versão refatorada do AutoDownloader.")
-    print("A lógica completa de scraping e download precisa ser")
-    print("implementada no módulo core/downloader.py")
-    print("\n💡 Estrutura modular criada com sucesso!")
-    print("   - config/     : Configurações")
-    print("   - models/     : Modelos de dados")
-    print("   - services/   : Serviços especializados")
-    print("   - core/       : Lógica principal")
-    print("   - utils/      : Utilitários")
-    print("   - notifications/: Sistema de notificações")
-    print("   - detectors/  : Detectores de pendências")
 
-    logger.info("Aplicação finalizada")
+    # Configurar WebDriver
+    print("\n🌐 Configurando navegador...")
+    driver = setup_webdriver(headless=args.headless)
+
+    try:
+        # Navegar para a plataforma
+        print(f"🔗 Acessando {settings.BASE_URL}...")
+        driver.get(settings.BASE_URL)
+
+        # Tentar carregar cookies
+        if load_cookies(driver):
+            logger.info("Cookies carregados com sucesso")
+            driver.refresh()
+
+        # Verificar login
+        if not is_logged_in(driver):
+            print("\n⚠️  É necessário fazer login manualmente")
+            print(f"⏳ Aguardando {args.login_wait} segundos para login...")
+
+            import time
+            time.sleep(args.login_wait)
+
+            if not is_logged_in(driver):
+                print("❌ Login não detectado. Encerrando.")
+                return
+
+            # Salvar cookies
+            save_cookies(driver)
+            logger.info("Login realizado e cookies salvos")
+
+        print("✅ Login verificado")
+
+        # Inicializar downloader
+        downloader = CourseDownloader(
+            driver=driver,
+            download_dir=str(download_dir),
+            telegram=telegram,
+            logger=logger
+        )
+
+        # Obter cursos disponíveis
+        courses = downloader.get_available_courses()
+
+        if not courses:
+            print("\n❌ Nenhum curso encontrado")
+            return
+
+        # Selecionar cursos
+        selected_courses = pick_courses(courses)
+
+        # Notificar início
+        if telegram:
+            telegram.notify_start(len(selected_courses))
+
+        # Download dos cursos
+        for i, course in enumerate(selected_courses, 1):
+            print(f"\n📥 Baixando curso {i}/{len(selected_courses)}")
+            downloader.download_course(course)
+
+        # Notificar conclusão
+        if telegram:
+            telegram.notify_complete("Concluído")
+
+        print("\n" + "=" * 70)
+        print("🎉 TODOS OS DOWNLOADS CONCLUÍDOS!")
+        print("=" * 70)
+
+    finally:
+        driver.quit()
+        logger.info("Aplicação finalizada")
 
 
 if __name__ == "__main__":
